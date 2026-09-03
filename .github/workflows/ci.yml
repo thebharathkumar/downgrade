@@ -32,9 +32,9 @@ jobs:
       - name: Install ruff
         run: pip install ruff
       - name: Lint
-        run: ruff check src/downgrade tests
+        run: ruff check src/downgrade tests scripts
       - name: Format check
-        run: ruff format --check src/downgrade tests
+        run: ruff format --check src/downgrade tests scripts
 
   typecheck:
     runs-on: ubuntu-latest

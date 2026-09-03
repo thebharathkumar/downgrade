@@ -1,0 +1,33 @@
+# Every external figure quoted anywhere in this repo, with a verification flag.
+#
+# Nothing with `verified: false` may appear in the README, the CLI output, or
+# any published report. tests/test_citations.py enforces that: it fails if an
+# unverified figure's value appears in a published artifact.
+#
+# arxiv.org is unreachable from the development container this repo was built
+# in, so these figures could not be checked against the abstract at authoring
+# time. Verify against the paper before publishing.
+
+- id: outcome_judge_loud_recall
+  source: "arXiv:2609.00038"
+  claim: "Outcome-only judges catch this share of loud faults."
+  value: "84%"
+  verified: false
+
+- id: outcome_judge_silent_recall
+  source: "arXiv:2609.00038"
+  claim: "Outcome-only judges catch this share of silent faults."
+  value: "45%"
+  verified: false
+
+- id: outcome_judge_false_flag
+  source: "arXiv:2609.00038"
+  claim: "Share of correct runs the outcome-only judge false-flags."
+  value: "33%"
+  verified: false
+
+- id: unfulfilled_claim_evasion
+  source: "arXiv:2609.00038"
+  claim: "Share of the time an unfulfilled claim evaded step-level judges."
+  value: "82%"
+  verified: false

@@ -328,6 +328,7 @@ class BaselineProfile(BaseModel):
     task_id: str
     baseline_arm: str
     replicate_count: int
+    reliability_threshold: float
     tool_signature_rates: dict[str, float] = Field(default_factory=dict)
     tool_name_rates: dict[str, float] = Field(default_factory=dict)
     median_tool_calls: float = 0.0
@@ -338,8 +339,42 @@ class BaselineProfile(BaseModel):
     correct_rate: float = 0.0
     answers: list[str] = Field(default_factory=list)
 
-    def is_reliable(self, rate_map: dict[str, float], key: str, threshold: float) -> bool:
-        return rate_map.get(key, 0.0) >= threshold
+    # How variable the baseline arm is with itself. A profile whose own
+    # behaviour scatters cannot support a claim that a downgraded arm
+    # departed from it, so these travel with every rate rather than being
+    # recomputed by whoever reads the report.
+    tool_call_count_mean: float = 0.0
+    tool_call_count_stdev: float = 0.0
+    distinct_answers: int = 0
+    modal_answer_rate: float = 0.0
+
+    @property
+    def sample_size(self) -> int:
+        return self.replicate_count
+
+    def rate_stderr(self, rate: float) -> float:
+        """Binomial standard error of a rate at this profile's sample size.
+
+        R is small by construction (5 by default), so every rate here is
+        coarse: at R=5 a rate can only take six values and its standard error
+        near 0.5 is about 0.22. Reporting the rate without this number invites
+        reading 4/5 versus 5/5 as a signal when it is one run.
+        """
+        n = self.replicate_count
+        if n <= 0:
+            return 0.0
+        return float((rate * (1.0 - rate) / n) ** 0.5)
+
+    def is_reliable(self, rate_map: dict[str, float], key: str) -> bool:
+        """Was this behaviour dependable enough in baseline to expect it?
+
+        The threshold is `reliability_threshold`, taken from the pre-registered
+        SweepConfig and copied onto the profile, not passed in by the caller.
+        A caller-supplied threshold is a knob that can be turned after seeing
+        results; this one cannot be moved without changing the config
+        fingerprint and invalidating the comparison.
+        """
+        return rate_map.get(key, 0.0) >= self.reliability_threshold
 
 
 class FindingRate(BaseModel):
@@ -363,6 +398,42 @@ ClassifyMode = Literal["structural", "judge", "both"]
 Verdict = Literal["LOUD", "SILENT", "CLEAN"]
 
 
+class NoiseFloor(BaseModel):
+    """How often the classifier fires when nothing was downgraded at all.
+
+    Computed leave-one-out over the baseline arm: for each baseline run, a
+    profile is built from the other R-1 runs and that run is scored against
+    it. Every finding this produces is a false positive by construction,
+    because both sides are the same arm at the same settings.
+
+    This is the first number the sweep reports, before any downgraded arm.
+    A finding rate on a downgraded arm means nothing until it is read against
+    the rate the same detector produces on baseline compared with itself. At
+    temperature 0.0 the floor should be near zero, and if it is not, that is
+    a result about the detector rather than about routing.
+    """
+
+    task_id: str
+    baseline_arm: str
+    replicate_count: int
+    finding_rates: list[FindingRate] = Field(default_factory=list)
+
+    def rate_for(self, kind: FindingKind) -> float:
+        for entry in self.finding_rates:
+            if entry.kind == kind:
+                return entry.rate
+        return 0.0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def total_false_positive_rate(self) -> float:
+        """Fraction of leave-one-out baseline runs that drew any finding."""
+        if self.replicate_count == 0:
+            return 0.0
+        flagged = sum(entry.occurrences for entry in self.finding_rates)
+        return min(1.0, flagged / self.replicate_count)
+
+
 class ArmComparison(BaseModel):
     """One downgraded arm scored against the baseline arm, for one task.
 
@@ -382,9 +453,19 @@ class ArmComparison(BaseModel):
     mode: ClassifyMode = "both"
     profile: BaselineProfile | None = None
     finding_rates: list[FindingRate] = Field(default_factory=list)
+    noise_floor: NoiseFloor | None = None
     baseline_correct_rate: float = 0.0
     downgraded_correct_rate: float = 0.0
     route_downgrade_rate: float = 0.0
+
+    def excess_over_floor(self, kind: FindingKind) -> float:
+        """Finding rate minus the rate the same detector fires at on baseline.
+
+        Never negative. This, not the raw rate, is what week 2 tests.
+        """
+        observed = next((e.rate for e in self.finding_rates if e.kind == kind), 0.0)
+        floor = self.noise_floor.rate_for(kind) if self.noise_floor is not None else 0.0
+        return max(0.0, observed - floor)
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -410,6 +491,10 @@ class ArmComparison(BaseModel):
 # --------------------------------------------------------------------------
 
 
+class RouterFormatUnknownError(RuntimeError):
+    """Raised when the router model string is built before the format is known."""
+
+
 def short_slug(model_id: str) -> str:
     """`accounts/fireworks/models/kimi-k3` -> `kimi-k3`; leave bare slugs alone."""
     return model_id.rsplit("/", 1)[-1]
@@ -433,7 +518,12 @@ class SweepConfig(BaseModel):
     max_tokens: int = 4096
     max_steps: int = 16
     replicates: int = 5
-    short_slugs: bool = True
+    # Pre-registered, not a knob. It sits inside the fingerprint, so a
+    # threshold changed after seeing results produces a config that no
+    # already-stored trajectory matches, and classify() refuses the run
+    # rather than quietly reporting a tuned number.
+    reliability_threshold: float = 0.8
+    short_slugs: bool | None = None
     arms: list[str] = Field(default_factory=list)
 
     @property
@@ -446,12 +536,19 @@ class SweepConfig(BaseModel):
         would be unwieldy, so the short slug is used here and the account prefix
         is stripped if a caller passes a fully-qualified ID.
 
-        This is the one wire-format detail that could not be confirmed against
-        the Fireworks docs at authoring time (docs.fireworks.ai was unreachable).
-        `downgrade doctor` issues a single probe request and reports which form
-        the API accepts; if it is the fully-qualified form, set
-        `short_slugs=False` and nothing else changes.
+        Which form the API accepts could not be confirmed from documentation,
+        so it is not guessed: `short_slugs` starts as None and `downgrade
+        doctor` determines it empirically by sending one probe request in each
+        form and keeping whichever the API accepts. Reading `router_model`
+        before that probe has run raises, rather than silently defaulting to a
+        form that may produce a 404 on the first real call of a paid sweep.
         """
+        if self.short_slugs is None:
+            raise RouterFormatUnknownError(
+                "Router wire format has not been probed. Run `downgrade doctor` "
+                "to determine whether firerouter/<pair> takes short slugs or "
+                "fully-qualified model IDs, then pass the result as short_slugs."
+            )
         if not self.short_slugs:
             return f"firerouter/{self.primary_model}/{self.secondary_model}"
         return f"firerouter/{short_slug(self.primary_model)}/{short_slug(self.secondary_model)}"
@@ -478,7 +575,9 @@ __all__ = [
     "Finding",
     "FindingKind",
     "FindingRate",
+    "NoiseFloor",
     "RouteObservation",
+    "RouterFormatUnknownError",
     "RouteSource",
     "RunStatus",
     "short_slug",

@@ -22,7 +22,9 @@ from downgrade.models import (
     Finding,
     FindingKind,
     FindingRate,
+    NoiseFloor,
     RouteObservation,
+    RouterFormatUnknownError,
     Step,
     SweepConfig,
     ToolCall,
@@ -290,23 +292,160 @@ class TestArmComparison:
         ]
 
 
+class TestNoiseFloor:
+    def test_rate_for_absent_kind_is_zero(self) -> None:
+        floor = NoiseFloor(task_id="t1", baseline_arm="baseline_direct", replicate_count=5)
+        assert floor.rate_for(FindingKind.MISSING_TOOL_CALL) == 0.0
+
+    def test_rate_for_reports_the_leave_one_out_false_positive_rate(self) -> None:
+        floor = NoiseFloor(
+            task_id="t1",
+            baseline_arm="baseline_direct",
+            replicate_count=5,
+            finding_rates=[
+                FindingRate(
+                    kind=FindingKind.REDUNDANT_RETRY,
+                    detector="structural",
+                    occurrences=1,
+                    replicate_count=5,
+                )
+            ],
+        )
+        assert floor.rate_for(FindingKind.REDUNDANT_RETRY) == pytest.approx(0.2)
+        assert floor.total_false_positive_rate == pytest.approx(0.2)
+
+    def test_total_false_positive_rate_is_capped_at_one(self) -> None:
+        """Several detectors can fire on the same run; the run is still one run."""
+        floor = NoiseFloor(
+            task_id="t1",
+            baseline_arm="baseline_direct",
+            replicate_count=2,
+            finding_rates=[
+                FindingRate(kind=k, detector="structural", occurrences=2, replicate_count=2)
+                for k in (FindingKind.REDUNDANT_RETRY, FindingKind.MISSING_TOOL_CALL)
+            ],
+        )
+        assert floor.total_false_positive_rate == 1.0
+
+    def test_empty_floor_does_not_divide_by_zero(self) -> None:
+        floor = NoiseFloor(task_id="t1", baseline_arm="b", replicate_count=0)
+        assert floor.total_false_positive_rate == 0.0
+
+
+class TestExcessOverFloor:
+    def _comparison(self, observed: int, floor_occurrences: int) -> ArmComparison:
+        kind = FindingKind.MISSING_TOOL_CALL
+        return ArmComparison(
+            task_id="t1",
+            baseline_arm="baseline_direct",
+            downgraded_arm="pref_5",
+            finding_rates=[
+                FindingRate(
+                    kind=kind, detector="structural", occurrences=observed, replicate_count=5
+                )
+            ],
+            noise_floor=NoiseFloor(
+                task_id="t1",
+                baseline_arm="baseline_direct",
+                replicate_count=5,
+                finding_rates=[
+                    FindingRate(
+                        kind=kind,
+                        detector="structural",
+                        occurrences=floor_occurrences,
+                        replicate_count=5,
+                    )
+                ],
+            ),
+        )
+
+    def test_excess_subtracts_the_floor(self) -> None:
+        cmp = self._comparison(observed=4, floor_occurrences=1)
+        assert cmp.excess_over_floor(FindingKind.MISSING_TOOL_CALL) == pytest.approx(0.6)
+
+    def test_a_rate_at_the_floor_is_not_a_finding(self) -> None:
+        """The whole point of measuring the floor first."""
+        cmp = self._comparison(observed=1, floor_occurrences=1)
+        assert cmp.excess_over_floor(FindingKind.MISSING_TOOL_CALL) == 0.0
+
+    def test_excess_never_goes_negative(self) -> None:
+        cmp = self._comparison(observed=1, floor_occurrences=4)
+        assert cmp.excess_over_floor(FindingKind.MISSING_TOOL_CALL) == 0.0
+
+    def test_without_a_floor_the_raw_rate_is_the_excess(self) -> None:
+        cmp = ArmComparison(
+            task_id="t1",
+            baseline_arm="b",
+            downgraded_arm="pref_5",
+            finding_rates=[
+                FindingRate(
+                    kind=FindingKind.MISSING_TOOL_CALL,
+                    detector="structural",
+                    occurrences=2,
+                    replicate_count=5,
+                )
+            ],
+        )
+        assert cmp.excess_over_floor(FindingKind.MISSING_TOOL_CALL) == pytest.approx(0.4)
+
+    def test_unobserved_kind_has_no_excess(self) -> None:
+        assert (
+            self._comparison(observed=0, floor_occurrences=0).excess_over_floor(
+                FindingKind.WRONG_ANSWER
+            )
+            == 0.0
+        )
+
+
 class TestBaselineProfile:
     def test_reliability_threshold(self) -> None:
         profile = BaselineProfile(
             task_id="t1",
             baseline_arm="pref_1",
             replicate_count=5,
+            reliability_threshold=0.8,
             tool_name_rates={"search": 1.0, "flaky": 0.4},
         )
-        assert profile.is_reliable(profile.tool_name_rates, "search", 0.8)
-        assert not profile.is_reliable(profile.tool_name_rates, "flaky", 0.8)
-        assert not profile.is_reliable(profile.tool_name_rates, "absent", 0.8)
+        assert profile.is_reliable(profile.tool_name_rates, "search")
+        assert not profile.is_reliable(profile.tool_name_rates, "flaky")
+        assert not profile.is_reliable(profile.tool_name_rates, "absent")
+
+    def test_sample_size_and_stderr_travel_with_the_profile(self) -> None:
+        """A rate at R=5 is coarse; reporting it without the error invites
+        reading 4/5 versus 5/5 as signal when it is one run."""
+        profile = BaselineProfile(
+            task_id="t1", baseline_arm="pref_1", replicate_count=5, reliability_threshold=0.8
+        )
+        assert profile.sample_size == 5
+        assert profile.rate_stderr(0.5) == pytest.approx(0.2236, abs=1e-3)
+        assert profile.rate_stderr(1.0) == 0.0
+
+    def test_stderr_is_zero_for_an_empty_profile(self) -> None:
+        profile = BaselineProfile(
+            task_id="t1", baseline_arm="pref_1", replicate_count=0, reliability_threshold=0.8
+        )
+        assert profile.rate_stderr(0.5) == 0.0
+
+    def test_dispersion_fields_are_carried(self) -> None:
+        profile = BaselineProfile(
+            task_id="t1",
+            baseline_arm="pref_1",
+            replicate_count=5,
+            reliability_threshold=0.8,
+            tool_call_count_mean=6.0,
+            tool_call_count_stdev=1.4,
+            distinct_answers=2,
+            modal_answer_rate=0.8,
+        )
+        assert profile.tool_call_count_stdev == 1.4
+        assert profile.modal_answer_rate == 0.8
 
     def test_serialises_set_fields(self) -> None:
         profile = BaselineProfile(
             task_id="t1",
             baseline_arm="pref_1",
             replicate_count=5,
+            reliability_threshold=0.8,
             grounded_values={"1.2", "3.4"},
         )
         assert sorted(json.loads(profile.model_dump_json())["grounded_values"]) == ["1.2", "3.4"]
@@ -317,10 +456,18 @@ class TestSweepConfig:
         assert short_slug("accounts/fireworks/models/kimi-k3") == "kimi-k3"
         assert short_slug("kimi-k3") == "kimi-k3"
 
-    def test_router_model_uses_short_slugs_by_default(self) -> None:
+    def test_router_model_raises_until_the_format_is_probed(self) -> None:
+        """No default. Guessing wrong 404s on the first call of a paid sweep."""
+        cfg = SweepConfig(primary_model="a", secondary_model="b")
+        assert cfg.short_slugs is None
+        with pytest.raises(RouterFormatUnknownError):
+            _ = cfg.router_model
+
+    def test_router_model_uses_short_slugs_when_probed_short(self) -> None:
         cfg = SweepConfig(
             primary_model="accounts/fireworks/models/kimi-k3",
             secondary_model="accounts/fireworks/models/glm-5p2",
+            short_slugs=True,
         )
         assert cfg.router_model == "firerouter/kimi-k3/glm-5p2"
 
@@ -331,6 +478,16 @@ class TestSweepConfig:
             short_slugs=False,
         )
         assert cfg.router_model.count("accounts/fireworks/models/") == 2
+
+    def test_reliability_threshold_is_inside_the_fingerprint(self) -> None:
+        """Pre-registration: the threshold cannot be tuned after seeing results
+        without invalidating every trajectory already stored under it."""
+        a = SweepConfig(primary_model="p", secondary_model="s", reliability_threshold=0.8)
+        b = SweepConfig(primary_model="p", secondary_model="s", reliability_threshold=0.6)
+        assert a.fingerprint != b.fingerprint
+
+    def test_default_reliability_threshold(self) -> None:
+        assert SweepConfig(primary_model="p", secondary_model="s").reliability_threshold == 0.8
 
     def test_fingerprint_changes_when_temperature_drifts(self) -> None:
         """The guard that stops an arm comparison from measuring sampling drift."""

@@ -33,6 +33,45 @@ No sweep results are published here yet. When they are, if the data shows no sil
 regression at any routing preference, that is what will be reported. The classifier is not
 tuned to produce findings.
 
+## Before you spend anything
+
+Three questions have to be answered against the live API rather than guessed,
+and all three come before the full sweep.
+
+```bash
+pip install -e ".[dev]"
+export FIREWORKS_API_KEY=...
+
+# 1. Which wire format does firerouter/<pair> take? Undocumented, so probed.
+downgrade doctor --primary <primary-slug> --secondary <secondary-slug>
+
+# 2. Does the preference dial actually change the served model, and what
+#    does one task cost across all six arms?
+downgrade smoke --primary <primary-slug> --secondary <secondary-slug> \
+    --short-slugs --replicates 3 --out runs/smoke.json
+```
+
+`doctor` sends one minimal request with the pair as short slugs and one with
+fully-qualified IDs, and reports which the API accepted. Nothing is assumed:
+`SweepConfig.router_model` raises `RouterFormatUnknownError` until this has
+answered, so a wrong guess fails before the sweep rather than on its first
+billable call.
+
+`smoke` runs one task across all six arms and reports, in this order: the
+control arm's agreement with itself, the per-arm downgrade rate, and the
+projected cost of the full sweep. The control arm's own variability comes
+first because every other number is read against it. If the preference dial
+turns out not to change which model serves these requests, `smoke` says so
+plainly. That is a real result, not a bug to work around.
+
+Neither command needs the corpus, so the answers arrive before the money.
+
+```bash
+# Build the corpus (once, on a machine that can reach sec.gov)
+python scripts/fetch_corpus.py --user-agent "Your Name you@example.com"
+downgrade verify
+```
+
 ## The six silent sub-classes
 
 Detected in priority order. Each finding carries the evidence that produced it: which step,

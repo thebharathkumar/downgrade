@@ -28,6 +28,7 @@ from downgrade.models import (
     Step,
     SweepConfig,
     ToolCall,
+    ToolResult,
     Trajectory,
     Usage,
     short_slug,
@@ -121,11 +122,32 @@ class TestTrajectory:
     def test_unattributed_steps_do_not_break_stability(self) -> None:
         assert make_trajectory(served=[None, None]).route_stability
 
-    def test_tool_signatures_skip_stepswithout_calls(self) -> None:
+    def test_tool_signatures_skip_steps_without_calls(self) -> None:
         traj = make_trajectory(served=["m", "m"])
-        traj.steps[0].tool_call = ToolCall(call_id="c", name="search", arguments={})
+        traj.steps[0].tool_calls = [ToolCall(call_id="c", name="search", arguments={})]
         assert traj.tool_names() == ["search"]
         assert len(traj.tool_signatures()) == 1
+
+    def test_a_turn_with_several_tool_calls_stays_one_step(self) -> None:
+        """One Step per API call. Splitting a parallel-call turn across Steps
+        would count the same tokens and the same route more than once."""
+        traj = make_trajectory(served=["m"])
+        traj.steps[0].tool_calls = [
+            ToolCall(call_id="a", name="search", arguments={"q": "x"}),
+            ToolCall(call_id="b", name="query_table", arguments={"c": "Assets"}),
+        ]
+        assert len(traj.steps) == 1
+        assert traj.tool_names() == ["search", "query_table"]
+        assert traj.totals.input_tokens == 10
+
+    def test_failed_tool_calls_are_addressable(self) -> None:
+        traj = make_trajectory(served=["m"])
+        traj.steps[0].tool_results = [
+            ToolResult(call_id="a", name="search", ok=True, content="hit"),
+            ToolResult(call_id="b", name="query_table", ok=False, error="no such column"),
+        ]
+        assert [r.name for r in traj.steps[0].failed_tool_calls] == ["query_table"]
+        assert len(traj.tool_results()) == 2
 
     def test_serialises_to_json(self) -> None:
         json.loads(make_trajectory(served=["m"]).model_dump_json())

@@ -121,16 +121,41 @@ class ToolCall(BaseModel):
         return f"{self.name}({canonical})"
 
 
+class ToolResult(BaseModel):
+    """What a tool returned for one call.
+
+    A failed tool is not an exception: the model gets the error back as an
+    observation and may recover from it. Whether it did is exactly what the
+    redundant_retry detector reads.
+    """
+
+    call_id: str
+    name: str
+    content: Any = None
+    ok: bool = True
+    error: str | None = None
+    latency_ms: int = 0
+
+
 class Step(BaseModel):
-    """One assistant turn, plus the tool result it produced if any."""
+    """One API call, and every tool call the resulting turn made.
+
+    Deliberately one Step per API call rather than per tool call. Usage,
+    latency and the route are properties of the request, so splitting a
+    multi-call turn across several Steps would count the same tokens more
+    than once in `Trajectory.totals` and record the same route twice.
+    """
 
     index: int
     thought: str = ""
-    tool_call: ToolCall | None = None
-    tool_result: Any = None
-    tool_error: str | None = None
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    tool_results: list[ToolResult] = Field(default_factory=list)
     route: RouteObservation
     error: str | None = None
+
+    @property
+    def failed_tool_calls(self) -> list[ToolResult]:
+        return [r for r in self.tool_results if not r.ok]
 
 
 RunStatus = Literal["completed", "errored", "no_termination"]
@@ -183,10 +208,13 @@ class Trajectory(BaseModel):
         return len(self.served_models) <= 1
 
     def tool_signatures(self) -> list[str]:
-        return [s.tool_call.signature() for s in self.steps if s.tool_call is not None]
+        return [call.signature() for step in self.steps for call in step.tool_calls]
 
     def tool_names(self) -> list[str]:
-        return [s.tool_call.name for s in self.steps if s.tool_call is not None]
+        return [call.name for step in self.steps for call in step.tool_calls]
+
+    def tool_results(self) -> list[ToolResult]:
+        return [result for step in self.steps for result in step.tool_results]
 
 
 # --------------------------------------------------------------------------
@@ -584,6 +612,7 @@ __all__ = [
     "Step",
     "SweepConfig",
     "ToolCall",
+    "ToolResult",
     "Trajectory",
     "Usage",
     "Verdict",

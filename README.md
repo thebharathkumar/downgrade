@@ -7,6 +7,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![mypy: strict](https://img.shields.io/badge/mypy-strict-blue.svg)](https://mypy-lang.org/)
 
+<!-- brag:start -->
+<p align="center">
+  <a href="https://github.com/thebharathkumar/downgrade/blob/HEAD/docs/brag/downgrade.mp4"><img src="https://raw.githubusercontent.com/thebharathkumar/downgrade/HEAD/docs/brag/downgrade.gif" alt="downgrade: 15-second technical brief" width="100%"></a>
+</p>
+<p align="center"><sub>15-second technical brief. <a href="https://github.com/thebharathkumar/downgrade/blob/HEAD/docs/brag/downgrade.mp4">Full MP4 with sound</a> &middot; more at <a href="https://thebharath.co">thebharath.co</a></sub></p>
+<!-- brag:end -->
+
 Model routers (Fireworks FireRouter/Nexus, OpenRouter auto, LiteLLM) send "easy" requests
 to cheaper models and report the savings. What they do not report is whether the answer got
 worse on the way. `downgrade` runs a fixed task suite against a router at every routing

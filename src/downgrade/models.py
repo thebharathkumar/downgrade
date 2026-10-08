@@ -551,6 +551,14 @@ class SweepConfig(BaseModel):
     # already-stored trajectory matches, and classify() refuses the run
     # rather than quietly reporting a tuned number.
     reliability_threshold: float = 0.8
+    # The statistics layer's settings are pre-registered the same way. Moving
+    # the false discovery rate or the effect size after seeing results
+    # changes the fingerprint, so the stored trajectories stop matching and
+    # the analysis refuses to run against them.
+    fdr_q: float = 0.05
+    sprt_alpha: float = 0.05
+    sprt_beta: float = 0.20
+    min_detectable_lift: float = 0.15
     short_slugs: bool | None = None
     arms: list[str] = Field(default_factory=list)
 

@@ -3,6 +3,7 @@
     downgrade doctor    probe the router wire format and check credentials
     downgrade smoke     run one task across all six arms and price the sweep
     downgrade verify    check the committed corpus against its manifest
+    downgrade report    classify stored runs, test them, and write the report
 
 `doctor` and `smoke` deliberately need no corpus. They answer the questions
 that must be settled before a paid sweep (does the pair string work, does the
@@ -21,11 +22,14 @@ from typing import Any
 import click
 
 from downgrade.arms import ALL_ARMS, PREFERENCE_LABELS
+from downgrade.classify import classify_sweep
 from downgrade.client import FireworksClient
-from downgrade.models import SweepConfig
+from downgrade.models import ClassifyMode, SweepConfig
 from downgrade.probe import SmokeReport, probe_router_format, run_smoke
+from downgrade.report import load_bundle, render_markdown
+from downgrade.stats import analyze
 from downgrade.suite.corpus import CorpusManifest, verify_corpus
-from downgrade.suite.spec import AnswerCheck, TaskSpec
+from downgrade.suite.spec import AnswerCheck, TaskSpec, load_suite
 from downgrade.tools import FunctionTool, ToolDef, ToolError, ToolRegistry
 from downgrade.transport import HttpTransport
 
@@ -343,6 +347,86 @@ def verify(corpus: Path) -> None:
     if not report.ok:
         raise click.ClickException("Corpus does not match its manifest.")
     click.echo("  corpus OK")
+
+
+@main.command()
+@click.option(
+    "--runs",
+    "runs_path",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="A `smoke --out` file, a run bundle, or a directory of them.",
+)
+@click.option(
+    "--suite",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Task YAML file or directory. The built-in probe task is always available.",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["structural", "judge", "both"]),
+    default="structural",
+    show_default=True,
+    help="judge and both call the Claude API for the two judge detectors.",
+)
+@click.option("--judge-model", default=None, help="Override the judge model.")
+@click.option("--out", type=click.Path(path_type=Path), default=None, help="Write Markdown here.")
+@click.option(
+    "--json", "json_out", type=click.Path(path_type=Path), default=None, help="Write JSON here."
+)
+def report(
+    runs_path: Path,
+    suite: Path | None,
+    mode: str,
+    judge_model: str | None,
+    out: Path | None,
+    json_out: Path | None,
+) -> None:
+    """Classify stored runs, test every arm against the noise floor, report.
+
+    Reads trajectories, never calls the router. Refuses runs whose config
+    fingerprint does not match the config stored beside them.
+    """
+    try:
+        bundle = load_bundle(runs_path)
+    except (ValueError, FileNotFoundError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+    tasks: dict[str, TaskSpec] = {PROBE_TASK.task_id: PROBE_TASK}
+    if suite is not None:
+        tasks.update(load_suite(suite).by_id())
+
+    judge = None
+    classify_mode: ClassifyMode = "structural"
+    if mode == "judge":
+        classify_mode = "judge"
+    elif mode == "both":
+        classify_mode = "both"
+    if classify_mode != "structural":
+        from downgrade.classify.judge import DEFAULT_JUDGE_MODEL, AnthropicJudge
+
+        judge = AnthropicJudge(model=judge_model or DEFAULT_JUDGE_MODEL)
+
+    try:
+        comparisons = classify_sweep(
+            tasks, bundle.trajectories, config=bundle.config, mode=classify_mode, judge=judge
+        )
+        analysis = analyze(comparisons, bundle.config)
+    except (KeyError, ValueError) as exc:
+        raise click.ClickException(str(exc).strip("'\"")) from None
+
+    markdown = render_markdown(analysis)
+    if out is None:
+        click.echo(markdown, nl=False)
+    else:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(markdown, encoding="utf-8")
+        click.echo(f"Wrote report to {out}")
+    if json_out is not None:
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(analysis.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        click.echo(f"Wrote analysis to {json_out}")
 
 
 if __name__ == "__main__":

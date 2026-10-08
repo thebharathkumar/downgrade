@@ -32,13 +32,15 @@ gate (an LLM judging the final answer) is close to blind to them by construction
 
 ## Status
 
-Week 1 of 3. The harness, the classifier, OTel emission and the CLI are in scope. The
-statistics layer (sequential testing, Benjamini-Hochberg, Kupiec and Christoffersen
-backtests) and the published report land in weeks 2 and 3 and are **not** built yet.
+Weeks 1 to 3 are built: the harness, the classifier, the statistics layer
+(anytime-valid sequential tests, Wald SPRT, Benjamini-Hochberg, Kupiec and
+Christoffersen backtests) and the published report (`downgrade report`).
+OpenTelemetry emission is specified below but not wired into the runner yet.
 
 No sweep results are published here yet. When they are, if the data shows no silent
 regression at any routing preference, that is what will be reported. The classifier is not
-tuned to produce findings.
+tuned to produce findings, and the report's headline is generated from the tests rather
+than written by hand.
 
 ## Before you spend anything
 
@@ -79,6 +81,22 @@ python scripts/fetch_corpus.py --user-agent "Your Name you@example.com"
 downgrade verify
 ```
 
+## From runs to a report
+
+```bash
+# Classify stored runs, test every arm against the noise floor, write the report.
+downgrade report --runs runs/smoke.json --out runs/report.md --json runs/report.json
+
+# Add the two judge detectors (calls the Claude API; needs ANTHROPIC_API_KEY).
+downgrade report --runs runs/ --suite path/to/tasks/ --mode both --out runs/report.md
+```
+
+`report` never calls the router. It reads trajectories (a `smoke --out` file, a run
+bundle, or a directory of them), recomputes the config fingerprint from the config stored
+beside them, and refuses runs that do not match it. A bundle whose FDR level or
+reliability threshold was edited after the runs fails to load rather than producing a
+re-tuned report.
+
 ## The six silent sub-classes
 
 Detected in priority order. Each finding carries the evidence that produced it: which step,
@@ -103,6 +121,29 @@ runs either half alone.
 as machine-checkable predicates in its YAML. A constraint that cannot be expressed as a
 predicate means the task is badly authored, and it gets rewritten rather than handed to a
 judge.
+
+## The statistics layer
+
+The unit of inference is one (downgraded arm, finding kind) pair, pooled across every task.
+At five replicates per task a per-task test cannot reject anything short of a huge effect,
+so per-task rates are reported as description and the tests pool.
+
+| Step | What it does | Where |
+|:-----|:-------------|:------|
+| Noise floor | Each baseline run scored leave-one-out against the other baseline runs. Every finding is a false positive by construction. | `classify/core.py` |
+| Null rate | The pooled floor, widened to its Wilson upper bound, so an imprecisely known floor counts against a discovery rather than for it. | `stats/sequential.py` |
+| Anytime-valid p-value | Mixture likelihood ratio over alternatives above the null. Valid at any stopping time, so peeking during a sweep does not inflate it. | `stats/sequential.py` |
+| SPRT | Wald's test between the null and null + `min_detectable_lift`: can the sweep stop adding replicates? Reported, not used to gate p-values. | `stats/sequential.py` |
+| Benjamini-Hochberg | FDR control over the whole pre-registered family: every arm times every kind the mode can produce, whether or not it fired. | `stats/multiple.py` |
+| Kupiec POF | Does an arm's any-finding rate match the floor? Two-sided, fixed-sample. | `stats/backtest.py` |
+| Christoffersen | Do findings cluster in run order (replicate-major across tasks)? If so, runs are not exchangeable and that arm's p-values are flagged as optimistic. | `stats/backtest.py` |
+
+`fdr_q`, `sprt_alpha`, `sprt_beta` and `min_detectable_lift` live on `SweepConfig` next to
+`reliability_threshold`, inside the fingerprint, for the same reason: they are
+pre-registered, and moving one after seeing results invalidates the stored runs.
+
+Each run gets at most one finding, the highest-priority sub-class that applies, so per-kind
+rates partition the runs and no run is counted twice.
 
 ## Design notes that are easy to get wrong
 
